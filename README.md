@@ -54,9 +54,12 @@ Unfortunately, `make install` of Mesos does not install these eggs to be detecte
 
 #### Q. Why can't I run a long-lived distcc cluster?
 
-See the TODOs below. Starting a cluster for each make invocation is simpler, and more elastic (it avoids keeping `distccd` daemons running when not in use). A long-lived distcc cluster would either be statically sized, or would introspect distcc state to determine how to size the cluster. 
+See the TODOs below. Starting a cluster for each make invocation was a simpler first approach, and more elastic (it avoids keeping `distccd` daemons running when not in use). A long-lived distcc cluster would either be statically sized, or would need to introspect into the distcc state to determine how to size the cluster.
 
-However, one downside of the current approach is that there is no sharing of the `distccd` servers across different builds.
+One downside of the current approach is that there is no sharing of the `distccd` servers across different builds.
+
+#### Q. Distcc does not seem to be communicating with the distccd servers.
+You will need network access from your client machine to the slave machines (specifically, to the ports being offered as slave resources).
 
 TODOs:
 ------
