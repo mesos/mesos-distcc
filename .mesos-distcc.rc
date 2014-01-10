@@ -1,0 +1,14 @@
+# This points mesos-distcc to the Mesos master.
+# Examples:
+#  MESOS_MASTER='hostname:5050'
+#  MESOS_MASTER='zk://host1:port1,host2:port2,.../path'
+#  MESOS_MASTER='zk://username:password@host1:port1,host2:port2,.../path'
+#  MESOS_MASTER='file://path/to/file'
+MESOS_MASTER=''
+
+# This is the path to the distccd binary on your slave machines.
+# Example:
+#  DISTCCD_PATH='distccd' # Assumes distccd can be reached via PATH.
+#  DISTCCD_PATH='/home/bmahler/distccd/bin/distccd' # Custom installation.
+DISTCCD_PATH='/home/bmahler/distcc/bin/distccd'
+

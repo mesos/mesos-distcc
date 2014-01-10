@@ -1,0 +1,204 @@
+#!/usr/bin/env python2.6
+
+# Support Python 2.6+ and 3.
+from __future__ import print_function
+
+import os
+import random
+import subprocess
+import sys
+
+import mesos
+import mesos_pb2
+
+
+class DistCCScheduler(mesos.Scheduler):
+    def __init__(self, max_slots, distccd_path, argv):
+        self.max_slots = max_slots
+        self.distccd_path = distccd_path
+        self.launched_slots = 0
+        self.launched_tasks = {}
+        self.running_tasks = {}
+        self.tid = 1
+        self.argv = argv
+
+    def registered(self, driver, frameworkId, masterInfo):
+        print('Registered with framework ID', frameworkId.value)
+
+    def resourceOffers(self, driver, offers):
+        print('Got', len(offers), 'resource offers')
+
+        random.shuffle(offers)
+        for offer in offers:
+            if self.launched_slots >= self.max_slots:
+                driver.declineOffer(offer.id)
+                return
+
+            print('Got resource offer', offer.id.value)
+
+            port = None
+            for resource in offer.resources:
+                if resource.name == 'cpus':
+                    cpus = resource.scalar.value
+                elif resource.name == 'mem':
+                    mem = resource.scalar.value
+                elif resource.name == 'ports' and resource.ranges.range:
+                    port = resource.ranges.range[0].begin
+
+            # This greedily tries to take as many resources as possible from each offer.
+            # Each slot is 1 CPU / 512 MB of memory.
+            slots = min(int(cpus), int(mem / 512))
+            slots = min(slots, self.max_slots - self.launched_slots)
+
+            if slots <= 0 or not port:
+                driver.declineOffer(offer.id)
+                continue
+
+            tid = self.tid
+            self.tid += 1
+
+            task = mesos_pb2.TaskInfo()
+            task.task_id.value = str(tid)
+            task.slave_id.value = offer.slave_id.value
+            task.name = 'distcc task ' + str(tid)
+
+            # TODO(bmahler): Only --allow from this machine's IP address.
+            task.command.value = \
+                self.distccd_path + ' ' \
+                '--daemon ' \
+                '--no-detach ' \
+                '--allow=0.0.0.0/0 ' \
+                '--port=%d ' \
+                '--jobs=%d' \
+                % (port, slots)
+
+            print(task.command.value)
+
+            cpus = task.resources.add()
+            cpus.name = 'cpus'
+            cpus.type = mesos_pb2.Value.SCALAR
+            cpus.scalar.value = slots
+
+            mem = task.resources.add()
+            mem.name = 'mem'
+            mem.type = mesos_pb2.Value.SCALAR
+            mem.scalar.value = slots * 512
+
+            print('Launching task', tid, 'on slave', offer.hostname)
+            driver.launchTasks(offer.id, [task])
+
+            self.launched_tasks[str(tid)] = offer.hostname + ':' + str(port)
+            self.launched_slots += slots
+
+    def statusUpdate(self, driver, update):
+        print('Task', update.task_id.value, 'is in state', update.state)
+
+        if update.state == mesos_pb2.TASK_RUNNING:
+            self.running_tasks[update.task_id.value] = self.launched_tasks[update.task_id.value]
+        elif update.state == mesos_pb2.TASK_FAILED:
+            print('Task', update.task_id.value, 'failed!')
+            driver.stop()
+            return
+
+        if len(self.running_tasks) == len(self.launched_tasks):
+            print('All tasks launched, proceeding with compilation')
+
+            env = dict(os.environ)
+            env['DISTCC_HOSTS'] = '--randomize '
+            # env['DISTCC_HOSTS'] += 'localhost '
+            for endpoint in self.running_tasks.values():
+                env['DISTCC_HOSTS'] += endpoint + ',cpp,lzo '
+
+            env['DISTCC_POTENTIAL_HOSTS'] = env['DISTCC_HOSTS']
+
+            p = subprocess.Popen('echo $DISTCC_HOSTS && echo $DISTCC_POTENTIAL_HOSTS && ' +
+                                 ' '.join(self.argv), shell=True, env=env)
+            p.wait()
+            print("'", ' '.join(self.argv), "' exited with status", p.returncode)
+            driver.stop()
+
+
+def usage():
+    print('Usage:', sys.argv[0], '[pump] make -jN CC=distcc CXX=distcc ...')
+    print('Note: The -j or --jobs argument is required.')
+    sys.exit(1)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        usage()
+
+    # Look for MESOS_MASTER and DISTCCD_PATH.
+    if os.getenv('MESOS_MASTER') and os.getenv('DISTCCD_PATH'):
+        MESOS_MASTER = os.getenv('MESOS_MASTER')
+        DISTCCD_PATH = os.getenv('DISTCCD_PATH')
+    else:
+        # Ensure that the mesos-distcc.rc file is visible.
+        # First look in the current directory, then in $HOME, then in the mesos-distcc directory.
+        paths = [os.getcwd(), os.environ['HOME'], os.path.dirname(os.path.realpath(__file__))]
+        for path in paths:
+            file = os.path.join(path, '.mesos-distcc.rc')
+            if os.path.isfile(file):
+                MESOS_MASTER, DISTCCD_PATH = None, None
+                execfile(file)
+
+                if not MESOS_MASTER:
+                    print('Please set MESOS_MASTER in', file)
+                    sys.exit(1)
+                elif not DISTCCD_PATH:
+                    print('Please set DISTCCD_PATH in', file)
+                    sys.exit(1)
+                else:
+                    break
+        else:
+            print('MESOS_MASTER and DISTCCD_PATH not found in environment, nor in:')
+            print('\t' + '\n\t'.join(paths))
+            sys.exit(1)
+
+    # Look for a jobs flag to compute the number of worker slots needed.
+    # It can take the following forms:
+    #   --jobs
+    #   --jobs=N
+    #   -j
+    #   -jN
+    #   -j N
+    jobs = 0
+    for index, arg in enumerate(sys.argv[1:]):
+        if arg.startswith('--jobs'):
+            split = arg.split('=')
+            if len(split) > 1:
+                jobs = int(split[1])
+            else:
+                jobs = 50
+        elif arg.startswith('-j'):
+            suffix = arg[2:]
+            if suffix:
+                jobs = int(suffix)
+            else:
+                # Look at the next argument for a number.
+                if len(sys.argv[1:]) > [index + 1]:
+                    try:
+                        jobs = int(sys.argv[1:][index + 1])
+                    except ValueError:
+                        jobs = 50
+
+    if jobs == 0 or 'make' not in sys.argv:
+        usage()
+
+    framework = mesos_pb2.FrameworkInfo()
+    framework.user = '' # Have Mesos fill in the current user.
+    framework.name = 'Distcc Cluster'
+    framework.failover_timeout = 1.0
+    framework.checkpoint = False
+
+    driver = mesos.MesosSchedulerDriver(
+        DistCCScheduler(jobs, DISTCCD_PATH, sys.argv[1:]),
+        framework,
+        MESOS_MASTER)
+
+    status = 0 if driver.run() == mesos_pb2.DRIVER_STOPPED else 1
+
+    # Ensure that the driver process terminates.
+    driver.stop()
+
+    sys.exit(status)
